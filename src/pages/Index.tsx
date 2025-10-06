@@ -1,5 +1,5 @@
-import GeminiImageGenerator from "@/components/GeminiImageGenerator";
-import { MadeWithDyad } from "@/components/made-with-dyad";
+import GeminiImageGenerator from "../components/GeminiImageGenerator";
+import { MadeWithDyad } from "../components/made-with-dyad";
 
 const Index = () => {
   return (
