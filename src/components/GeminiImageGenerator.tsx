@@ -22,6 +22,29 @@ function base64ToBlob(base64: string, contentType = "image/png") {
 
 const STORAGE_KEY = "gemini_api_key";
 
+async function fileToBase64WithoutPrefix(file: File): Promise<{ base64: string; mime: string }> {
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => {
+      reader.abort();
+      reject(new Error("Error reading file"));
+    };
+    reader.onload = () => {
+      const result = reader.result as string;
+      // result is data:<mime>;base64,<DATA>
+      const match = result.match(/^data:(.*);base64,(.*)$/);
+      if (!match) {
+        reject(new Error("Unexpected file result format"));
+        return;
+      }
+      const mime = match[1];
+      const base64 = match[2];
+      resolve({ base64, mime });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 const GeminiImageGenerator: React.FC = () => {
   const [apiKey, setApiKey] = React.useState<string>(() => {
     try {
@@ -34,14 +57,22 @@ const GeminiImageGenerator: React.FC = () => {
     "Create a picture of a nano banana dish in a fancy restaurant with a Gemini theme"
   );
   const [loading, setLoading] = React.useState(false);
-  const [imageUrl, setImageUrl] = React.useState<string | null>(null);
-  const [imageBlob, setImageBlob] = React.useState<Blob | null>(null);
 
+  // Generated image state
+  const [generatedImageUrl, setGeneratedImageUrl] = React.useState<string | null>(null);
+  const [generatedImageBlob, setGeneratedImageBlob] = React.useState<Blob | null>(null);
+
+  // Source/uploaded image state (for inline_data)
+  const [sourceFile, setSourceFile] = React.useState<File | null>(null);
+  const [sourceBase64, setSourceBase64] = React.useState<string | null>(null);
+  const [sourceMime, setSourceMime] = React.useState<string | null>(null);
+  const [sourcePreviewUrl, setSourcePreviewUrl] = React.useState<string | null>(null);
+
+  // Cleanup object URLs on unmount
   React.useEffect(() => {
     return () => {
-      if (imageUrl) {
-        URL.revokeObjectURL(imageUrl);
-      }
+      if (generatedImageUrl) URL.revokeObjectURL(generatedImageUrl);
+      if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -55,11 +86,44 @@ const GeminiImageGenerator: React.FC = () => {
     }
   };
 
-  const clearImage = () => {
-    if (imageUrl) {
-      URL.revokeObjectURL(imageUrl);
-      setImageUrl(null);
-      setImageBlob(null);
+  const clearGeneratedImage = () => {
+    if (generatedImageUrl) {
+      URL.revokeObjectURL(generatedImageUrl);
+      setGeneratedImageUrl(null);
+      setGeneratedImageBlob(null);
+    }
+  };
+
+  const clearSourceImage = () => {
+    setSourceFile(null);
+    setSourceBase64(null);
+    setSourceMime(null);
+    if (sourcePreviewUrl) {
+      URL.revokeObjectURL(sourcePreviewUrl);
+      setSourcePreviewUrl(null);
+    }
+  };
+
+  const onSourceFileChange = async (file?: File) => {
+    if (!file) {
+      clearSourceImage();
+      return;
+    }
+    try {
+      const { base64, mime } = await fileToBase64WithoutPrefix(file);
+      // create preview URL
+      const preview = URL.createObjectURL(file);
+      // revoke old preview if present
+      if (sourcePreviewUrl) {
+        URL.revokeObjectURL(sourcePreviewUrl);
+      }
+      setSourceFile(file);
+      setSourceBase64(base64);
+      setSourceMime(mime);
+      setSourcePreviewUrl(preview);
+    } catch (e) {
+      showError("No se pudo procesar la imagen de entrada.");
+      console.error("fileToBase64 error:", e);
     }
   };
 
@@ -76,80 +140,100 @@ const GeminiImageGenerator: React.FC = () => {
     setLoading(true);
     const loadingId = showLoading("Generando imagen...");
 
+    // Build parts: always include prompt text first
+    const parts: any[] = [{ text: prompt }];
+
+    // If there's a source image, include inline_data part
+    if (sourceBase64 && sourceMime) {
+      parts.push({
+        inline_data: {
+          mime_type: sourceMime,
+          data: sourceBase64,
+        },
+      });
+    }
+
     const body = {
       contents: [
         {
-          parts: [{ text: prompt }],
+          parts,
         },
       ],
     };
 
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify(body),
-    });
-
-    dismissToast(loadingId);
-
-    if (!res.ok) {
-      const text = await res.text();
-      showError(`Error en la API: ${res.status} ${res.statusText}`);
-      console.error("Response text:", text);
-      setLoading(false);
-      return;
-    }
-
-    const text = await res.text();
-
-    // Extraer campo "data": "BASE64..." si existe en la respuesta
-    const match = text.match(/"data"\s*:\s*"([^"]*)"/);
-    let base64: string | null = null;
-
-    if (match && match[1]) {
-      base64 = match[1];
-    } else {
-      // Intentar parsear JSON y buscar recursivamente
-      try {
-        const parsed = JSON.parse(text);
-        const findData = (obj: any): string | null => {
-          if (!obj || typeof obj !== "object") return null;
-          if (typeof obj.data === "string") return obj.data;
-          for (const key of Object.keys(obj)) {
-            const val = obj[key];
-            if (typeof val === "object") {
-              const found = findData(val);
-              if (found) return found;
-            }
-          }
-          return null;
-        };
-        base64 = findData(parsed);
-      } catch (e) {
-        // ignore
-      }
-    }
-
-    if (!base64) {
-      showError("No se encontró datos de imagen en la respuesta.");
-      console.error("Respuesta completa:", text);
-      setLoading(false);
-      return;
-    }
-
     try {
-      const blob = base64ToBlob(base64);
-      clearImage();
-      const url = URL.createObjectURL(blob);
-      setImageBlob(blob);
-      setImageUrl(url);
-      showSuccess("Imagen generada correctamente");
+      const res = await fetch(ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify(body),
+      });
+
+      dismissToast(loadingId);
+
+      if (!res.ok) {
+        const text = await res.text();
+        showError(`Error en la API: ${res.status} ${res.statusText}`);
+        console.error("Response text:", text);
+        setLoading(false);
+        return;
+      }
+
+      const text = await res.text();
+
+      // Extraer campo "data": "BASE64..." si existe en la respuesta
+      const match = text.match(/"data"\s*:\s*"([^"]*)"/);
+      let base64: string | null = null;
+
+      if (match && match[1]) {
+        base64 = match[1];
+      } else {
+        // Intentar parsear JSON y buscar recursivamente
+        try {
+          const parsed = JSON.parse(text);
+          const findData = (obj: any): string | null => {
+            if (!obj || typeof obj !== "object") return null;
+            if (typeof obj.data === "string") return obj.data;
+            for (const key of Object.keys(obj)) {
+              const val = obj[key];
+              if (typeof val === "object") {
+                const found = findData(val);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+          base64 = findData(parsed);
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (!base64) {
+        showError("No se encontró datos de imagen en la respuesta.");
+        console.error("Respuesta completa:", text);
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const blob = base64ToBlob(base64);
+        clearGeneratedImage();
+        const url = URL.createObjectURL(blob);
+        setGeneratedImageBlob(blob);
+        setGeneratedImageUrl(url);
+        showSuccess("Imagen generada correctamente");
+      } catch (e) {
+        showError("Error procesando la imagen recibida.");
+        console.error("Blob conversion error:", e);
+      }
     } catch (e) {
-      showError("Error procesando la imagen recibida.");
-      console.error("Blob conversion error:", e);
+      // network or unexpected error
+      dismissToast(loadingId);
+      showError("Error al conectar con la API.");
+      console.error("Fetch error:", e);
     } finally {
       setLoading(false);
     }
@@ -172,7 +256,7 @@ const GeminiImageGenerator: React.FC = () => {
               placeholder="Introduce tu API key de Gemini"
               className="flex-1"
             />
-            <Button onClick={saveApiKey} className="whitespace-nowrap">
+            <Button onClick={saveApiKey} className="whitespace-nowrap" variant="default">
               Guardar
             </Button>
           </div>
@@ -194,35 +278,100 @@ const GeminiImageGenerator: React.FC = () => {
           />
         </div>
 
+        <div>
+          <Label className="mb-1">Imagen de entrada (opcional)</Label>
+          <div className="flex items-center gap-2">
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  onSourceFileChange(file);
+                } else {
+                  clearSourceImage();
+                }
+              }}
+              className="text-sm"
+            />
+            {sourceFile && (
+              <Button onClick={clearSourceImage} variant="ghost">
+                Eliminar imagen
+              </Button>
+            )}
+          </div>
+          {sourcePreviewUrl ? (
+            <div className="mt-2 flex items-start gap-4">
+              <img
+                src={sourcePreviewUrl}
+                alt="Preview entrada"
+                className="w-40 h-auto rounded-md border"
+              />
+              <div className="text-sm text-gray-600">
+                <div><strong>{sourceFile?.name}</strong></div>
+                <div>{sourceMime}</div>
+                <div className="mt-2">
+                  <Button
+                    onClick={() => {
+                      // descargar la imagen de entrada
+                      if (!sourcePreviewUrl) return;
+                      const a = document.createElement("a");
+                      a.href = sourcePreviewUrl;
+                      a.download = sourceFile?.name ?? "source-image";
+                      a.click();
+                    }}
+                    variant="secondary"
+                  >
+                    Descargar entrada
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500 mt-2">No hay imagen de entrada seleccionada.</p>
+          )}
+        </div>
+
         <div className="flex items-center gap-3">
-          <Button onClick={handleGenerate} disabled={loading}>
+          <Button onClick={handleGenerate} disabled={loading} variant="default">
             {loading ? "Generando..." : "Generar imagen"}
           </Button>
 
-          <Button onClick={clearImage} disabled={!imageUrl || loading} className="bg-transparent">
-            Limpiar
+          <Button
+            onClick={() => {
+              clearGeneratedImage();
+            }}
+            disabled={!generatedImageUrl || loading}
+            variant="ghost"
+          >
+            Limpiar resultado
           </Button>
         </div>
 
         <div>
           <Label>Vista previa</Label>
           <div className="mt-2">
-            {imageUrl ? (
+            {generatedImageUrl ? (
               <div className="flex flex-col sm:flex-row gap-4 items-start">
                 <img
-                  src={imageUrl}
+                  src={generatedImageUrl}
                   alt="Vista previa generada"
                   className="max-w-full w-80 h-auto rounded-md border"
                 />
                 <div className="flex flex-col gap-2">
-                  <a href={imageUrl} download="gemini-image.png" className="inline-block">
-                    <Button>Descargar imagen</Button>
+                  <a
+                    href={generatedImageUrl}
+                    download="gemini-image.png"
+                    className="inline-block"
+                  >
+                    <Button variant="secondary">Descargar imagen</Button>
                   </a>
                   <Button
                     onClick={() => {
-                      window.open(imageUrl, "_blank");
+                      // abrir en nueva pestaña
+                      window.open(generatedImageUrl, "_blank");
                     }}
-                    className="border"
+                    variant="outline"
                   >
                     Abrir en nueva pestaña
                   </Button>
